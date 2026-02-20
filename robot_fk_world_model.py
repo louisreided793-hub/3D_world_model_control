@@ -177,6 +177,7 @@ class RobotFKWorldModel:
         image_shape: Tuple[int, int],
         camera_name: Optional[str] = None,
         pad: int = 50,
+        flip_along_h: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         将点云投影为 mask（自适应 padding 版本）。
@@ -184,7 +185,8 @@ class RobotFKWorldModel:
         说明：
         - `pad` 作为最小保底 padding；
         - 实际 padding 会根据当前投影 u/v 越界量动态计算，越界越多 padding 越大；
-        - 随着 gripper 对齐后越界量变小，padding 会自动减小。
+        - 随着 gripper 对齐后越界量变小，padding 会自动减小；
+        - `flip_along_h=True` 时，会沿 H 方向做镜像翻转（上下翻转）。
         """
         camera_name = camera_name or self.default_camera
         K = self.cameras[camera_name].intrinsic
@@ -220,6 +222,11 @@ class RobotFKWorldModel:
 
         mask = np.zeros((hp, wp), dtype=np.uint8)
         mask[vp, up] = 255
+
+        if flip_along_h:
+            mask = np.flip(mask, axis=0)
+            vp = (hp - 1) - vp
+
         return mask, np.stack([up, vp], axis=1)
 
     @staticmethod
