@@ -1,0 +1,6 @@
+{
+  "action_is_scalar": true,
+  "num_samples": 500,
+  "action_min": 0.0,
+  "action_max": 0.06972000002861023
+}
