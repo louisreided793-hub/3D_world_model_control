@@ -1724,7 +1724,9 @@ class CondGenerator:
         gripper_pts: Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]],
         extrinsics_list: List[Dict[str, np.ndarray]],
         is_2D_aligned: bool,
-        current_future_action: List[np.ndarray]
+        current_future_action: List[np.ndarray],
+        current_future_obs: Optional[List[List[np.ndarray]]] = None,
+        current_obs: Optional[List[np.ndarray]] = None,
     ) -> List[List[np.ndarray]]:
         """
         生成gripper交互条件（3D碰撞检测 + 投影到三视角）
@@ -1745,6 +1747,7 @@ class CondGenerator:
             return np.concatenate([pts, np.tile(color, (len(pts), 1))], axis=-1)
         
         cond_video = []
+        fallback_rgb_warned = False
         
         print(f"🎯 生成gripper交互条件 (K={K} 时间步, 4个gripper独立检测)")
         
@@ -1773,10 +1776,25 @@ class CondGenerator:
                         extrinsic=extrinsic
                     )
                 else:
+                    rgb_t = None
+                    if current_future_obs is not None and t < len(current_future_obs):
+                        cam_idx = self.camera_names.index(cam)
+                        if cam_idx < len(current_future_obs[t]):
+                            rgb_t = current_future_obs[t][cam_idx]
+                    elif current_obs is not None:
+                        cam_idx = self.camera_names.index(cam)
+                        if cam_idx < len(current_obs):
+                            rgb_t = current_obs[cam_idx]
+                        if not fallback_rgb_warned:
+                            print("[WARN] current_future_obs 未提供，wrist GT mask 将回退到当前帧 RGB，"
+                                  "与 future action 可能存在时序偏差。")
+                            fallback_rgb_warned = True
+
                     proj_image = self._project_gripper_to_image_refine(
                         gripper_points=all_grippers,
                         cam_name=cam,
-                        action=current_future_action[t]
+                        action=current_future_action[t],
+                        rgb=rgb_t,
                     )
                 frame_images.append(proj_image)
             
@@ -1895,6 +1913,11 @@ class CondGenerator:
             else:
                 arm_colors = colors[2 * N_per_gripper:]
 
+        if cam_name in ('left', 'right') and rgb is None:
+            raise ValueError(
+                f"_project_gripper_to_image_refine requires timestamp-aligned RGB for {cam_name} wrist camera."
+            )
+
         gripper_gt_mask = self._lookup_gripper_gt_mask(action, rgb, cam_name, image_size)
         result_map, filled_mask, _ = self._match_and_interpolate_gripper(
             action, arm_colors, gripper_gt_mask, cam_name, image_size=image_size
@@ -1911,6 +1934,7 @@ class CondGenerator:
         self, 
         current_obs: List[np.ndarray], 
         current_future_action: np.ndarray,
+        current_future_obs: Optional[List[List[np.ndarray]]] = None,
         modality: str = "3D",
         cond: str = "gripper_interact"
     ) -> Tuple[List[List[np.ndarray]], Dict[str, np.ndarray]]:
@@ -1992,7 +2016,9 @@ class CondGenerator:
                 (gripper_pts_lg1, gripper_pts_lg2, gripper_pts_rg1, gripper_pts_rg2),
                 extrinsics_list=extrinsics_list,
                 is_2D_aligned=False if modality == "3D" else True,
-                current_future_action=current_future_action if modality == "3D" else None
+                current_future_action=current_future_action if modality == "3D" else None,
+                current_future_obs=current_future_obs,
+                current_obs=current_obs,
             )
             return cond_video, arm_masks
         elif cond == "implicit":
