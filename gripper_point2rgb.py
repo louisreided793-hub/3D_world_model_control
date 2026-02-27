@@ -230,35 +230,71 @@ def visualize_idx_map_on_mask(
     return vis
 
 
+def paint_mask_with_values(
+    gripper_mask: np.ndarray,
+    idx_map: np.ndarray,
+    point_values: np.ndarray,
+    invalid_value: float = 0.0,
+    left_gripper_count: int = 5000,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    按 idx_map 将点级 value 填充到像素网格，并返回填充状态和左右夹爪来源。
+
+    Args:
+        gripper_mask: (H, W) binary / uint8 mask
+        idx_map:      (H, W) int, -1 表示该像素未分配到点
+        point_values: (N, 3) 或 (N, K, 3)
+        invalid_value: 未填充像素的默认值
+        left_gripper_count: gripper_pts 前多少个点视为 left gripper
+
+    Returns:
+        result_map:
+            - point_values 为 (N, 3) 时，shape=(H, W, 3)
+            - point_values 为 (N, K, 3) 时，shape=(H, W, K, 3)
+        filled_mask: (H, W) bool，成功填充值的位置
+        lr_mask:     (H, W) int8，left=0, right=1, invalid=-1
+    """
+    H, W = gripper_mask.shape
+    values = np.asarray(point_values)
+    if values.ndim not in (2, 3) or values.shape[-1] != 3:
+        raise ValueError(
+            "point_values 只支持 (N, 3) 或 (N, K, 3) 两种形状，且最后一维必须为 3"
+        )
+
+    num_points = values.shape[0]
+    if values.ndim == 2:
+        result_map = np.full((H, W, 3), invalid_value, dtype=values.dtype)
+    else:
+        result_map = np.full((H, W, values.shape[1], 3), invalid_value, dtype=values.dtype)
+
+    filled_mask = (gripper_mask > 0) & (idx_map >= 0) & (idx_map < num_points)
+    if np.any(filled_mask):
+        ys, xs = np.where(filled_mask)
+        result_map[ys, xs] = values[idx_map[ys, xs]]
+
+    lr_mask = np.full((H, W), -1, dtype=np.int8)
+    if np.any(filled_mask):
+        valid_indices = idx_map[filled_mask]
+        lr_mask[filled_mask] = (valid_indices >= left_gripper_count).astype(np.int8)
+
+    return result_map, filled_mask, lr_mask
+
+
 def paint_mask_with_k3_values(
     gripper_mask: np.ndarray,
     idx_map: np.ndarray,
     point_values: np.ndarray,
     invalid_value: float = 0.0,
 ) -> np.ndarray:
-    """
-    Assign [k,3] values to each pixel in gripper_mask using idx_map.
-
-    Args:
-        gripper_mask: (H, W) binary mask
-        idx_map:      (H, W) int, -1 means invalid
-        point_values: (N, k, 3)
-
-    Returns:
-        value_map: (H, W, k, 3)
-    """
-    H, W = gripper_mask.shape
-    k = point_values.shape[1]
-
-    value_map = np.full((H, W, k, 3), invalid_value, dtype=point_values.dtype)
-
-    valid = (gripper_mask > 0) & (idx_map >= 0)
-    if not np.any(valid):
-        return value_map
-
-    ys, xs = np.where(valid)
-    value_map[ys, xs] = point_values[idx_map[ys, xs]]
-
+    """兼容旧接口：仅返回 (H, W, K, 3) value_map。"""
+    value_map, _, _ = paint_mask_with_values(
+        gripper_mask=gripper_mask,
+        idx_map=idx_map,
+        point_values=point_values,
+        invalid_value=invalid_value,
+    )
+    if value_map.ndim != 4:
+        raise ValueError("point_values 应为 (N, K, 3)，当前收到的是 (N, 3)")
     return value_map
 
 
