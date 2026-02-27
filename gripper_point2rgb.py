@@ -230,12 +230,35 @@ def visualize_idx_map_on_mask(
     return vis
 
 
+def build_point_value_index_map(
+    idx_map: np.ndarray,
+    point_indices: Optional[np.ndarray],
+    point_count: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """将 idx_map(投影点索引) 映射为 point_values 原始索引图。"""
+    if point_indices is None:
+        mapped_idx_map = idx_map.astype(np.int64, copy=False)
+    else:
+        point_indices = np.asarray(point_indices).reshape(-1)
+        if point_indices.ndim != 1:
+            raise ValueError("point_indices 必须是一维数组")
+
+        mapped_idx_map = -np.ones_like(idx_map, dtype=np.int64)
+        valid_proj = (idx_map >= 0) & (idx_map < point_indices.shape[0])
+        if np.any(valid_proj):
+            mapped_idx_map[valid_proj] = point_indices[idx_map[valid_proj]]
+
+    valid_point = (mapped_idx_map >= 0) & (mapped_idx_map < point_count)
+    return mapped_idx_map, valid_point
+
+
 def paint_mask_with_values(
     gripper_mask: np.ndarray,
     idx_map: np.ndarray,
     point_values: np.ndarray,
     invalid_value: float = 0.0,
     left_gripper_count: int = 5000,
+    point_indices: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     按 idx_map 将点级 value 填充到像素网格，并返回填充状态和左右夹爪来源。
@@ -246,6 +269,8 @@ def paint_mask_with_values(
         point_values: (N, 3) 或 (N, K, 3)
         invalid_value: 未填充像素的默认值
         left_gripper_count: gripper_pts 前多少个点视为 left gripper
+        point_indices: (M,) 可选。若提供，则 idx_map 的索引先映射到 point_values 的原始索引。
+            常见于 idx_map 是 "投影后点集" 的索引，而非原始 gripper_pts 索引。
 
     Returns:
         result_map:
@@ -267,14 +292,15 @@ def paint_mask_with_values(
     else:
         result_map = np.full((H, W, values.shape[1], 3), invalid_value, dtype=values.dtype)
 
-    filled_mask = (gripper_mask > 0) & (idx_map >= 0) & (idx_map < num_points)
+    mapped_idx_map, valid_point = build_point_value_index_map(idx_map, point_indices, num_points)
+    filled_mask = (gripper_mask > 0) & valid_point
     if np.any(filled_mask):
         ys, xs = np.where(filled_mask)
-        result_map[ys, xs] = values[idx_map[ys, xs]]
+        result_map[ys, xs] = values[mapped_idx_map[ys, xs]]
 
     lr_mask = np.full((H, W), -1, dtype=np.int8)
     if np.any(filled_mask):
-        valid_indices = idx_map[filled_mask]
+        valid_indices = mapped_idx_map[filled_mask]
         lr_mask[filled_mask] = (valid_indices >= left_gripper_count).astype(np.int8)
 
     return result_map, filled_mask, lr_mask
@@ -285,6 +311,7 @@ def paint_mask_with_k3_values(
     idx_map: np.ndarray,
     point_values: np.ndarray,
     invalid_value: float = 0.0,
+    point_indices: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """兼容旧接口：仅返回 (H, W, K, 3) value_map。"""
     value_map, _, _ = paint_mask_with_values(
@@ -292,6 +319,7 @@ def paint_mask_with_k3_values(
         idx_map=idx_map,
         point_values=point_values,
         invalid_value=invalid_value,
+        point_indices=point_indices,
     )
     if value_map.ndim != 4:
         raise ValueError("point_values 应为 (N, K, 3)，当前收到的是 (N, 3)")
