@@ -412,12 +412,14 @@ class RobotFKWorldModel:
         if not np.any(valid):
             return idx_map
 
+        orig_indices = np.flatnonzero(valid).astype(np.int32)
         uv = uv[valid]
 
         # --------------------------------------------------
         # 2. 直接命中的像素先写入（O(M)，很快）
         # --------------------------------------------------
-        idx_map[uv[:, 1], uv[:, 0]] = np.arange(len(uv), dtype=np.int32)
+        # 注意：这里写入的是原始 uv_pixels 中的索引，避免因 valid 过滤导致索引重排。
+        idx_map[uv[:, 1], uv[:, 0]] = orig_indices
 
         # --------------------------------------------------
         # 3. 只对 mask 内像素做 NN 查询
@@ -435,7 +437,8 @@ class RobotFKWorldModel:
         tree = cKDTree(proj_points)
         nn_idx = tree.query(query_pixels, k=1, workers=-1)[1].astype(np.int32)
 
-        idx_map[ys, xs] = nn_idx
+        # nn_idx 是过滤后 uv 的局部索引，需要映射回原始 uv_pixels 索引。
+        idx_map[ys, xs] = orig_indices[nn_idx]
         return idx_map
 
     @staticmethod
