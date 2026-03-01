@@ -1341,7 +1341,23 @@ class CondGenerator:
 
             result_map, filled_mask, lr_mask = self.gripper_gt_provider.paint_mask_with_values(gripper_gt_mask, index_map, values)
 
-            return result_map, filled_mask, lr_mask
+            lr_mask_process = np.full_like(lr_mask, -1)
+            for label in (0, 1):
+                label_mask = (lr_mask == label).astype(np.uint8)
+                if np.any(label_mask):
+                    num_labels, comp_labels, stats, _ = cv2.connectedComponentsWithStats(label_mask, connectivity=8)
+                    if num_labels > 2:
+                        largest_comp = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+                        keep_mask = comp_labels == largest_comp
+                    else:
+                        keep_mask = label_mask.astype(bool)
+                    lr_mask_process[keep_mask] = label
+
+            invalid_idx = (lr_mask_process == -1)
+            result_map[invalid_idx] = 0
+            filled_mask[invalid_idx] = False
+
+            return result_map, filled_mask, lr_mask_process
 
     def _depth_to_pointcloud(
             self,
