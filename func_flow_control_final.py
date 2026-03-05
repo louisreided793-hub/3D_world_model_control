@@ -1,4 +1,5 @@
 import h5py
+import json
 import numpy as np
 import torch
 import os
@@ -15,6 +16,105 @@ import cv2
 import roboticstoolbox as rtb
 from scipy.spatial import KDTree
 import pdb
+from robot_fk_world_model import RobotFKWorldModel
+
+
+class GripperGTMaskProvider:
+    """为 wrist 相机提供 action 对应的 gripper GT mask。"""
+
+    def __init__(
+        self,
+        urdf_path: str,
+        gripper_mesh_dir: str,
+        left_book_path: str = "left_arm_gripper_action_to_centroids_1d/action_projection_records.json",
+        right_book_path: str = "right_arm_gripper_action_to_centroids_1d/action_projection_records.json",
+        link7_corr_path: Optional[str] = None,
+        link8_corr_path: Optional[str] = None,
+        sample_count: int = 2000,
+    ):
+        self.left_db = self._load_projection_book(left_book_path)
+        self.right_db = self._load_projection_book(right_book_path)
+        self._h5_cache: Dict[str, h5py.File] = {}
+
+        self.left_model = RobotFKWorldModel(
+            urdf_path=urdf_path,
+            gripper_mesh_dir=gripper_mesh_dir,
+            link7_corr_path=link7_corr_path,
+            link8_corr_path=link8_corr_path,
+            default_camera="left",
+            preload_sample_count=sample_count,
+        )
+        self.right_model = RobotFKWorldModel(
+            urdf_path=urdf_path,
+            gripper_mesh_dir=gripper_mesh_dir,
+            link7_corr_path=link7_corr_path,
+            link8_corr_path=link8_corr_path,
+            default_camera="right",
+            preload_sample_count=sample_count,
+        )
+
+    @staticmethod
+    def _load_projection_book(book_path: str) -> Dict:
+        with open(book_path, "r", encoding="utf-8") as f:
+            book = json.load(f)
+        records = book.get("records", {})
+
+        action_list = []
+        frame_list = []
+        for k, rec in records.items():
+            if not isinstance(rec, dict):
+                continue
+            if "action" not in rec:
+                continue
+            action_list.append(np.asarray(rec["action"], dtype=np.float64))
+            frame_list.append(int(rec.get("frame_index", k)))
+
+        action_mat = np.stack(action_list, axis=0) if len(action_list) > 0 else np.zeros((0, 14), dtype=np.float64)
+        return {
+            "meta": book.get("meta", {}),
+            "records": records,
+            "actions": action_mat,
+            "frame_indices": np.asarray(frame_list, dtype=np.int32),
+        }
+
+    def _get_h5(self, h5_path: str) -> h5py.File:
+        if h5_path not in self._h5_cache:
+            self._h5_cache[h5_path] = h5py.File(h5_path, "r")
+        return self._h5_cache[h5_path]
+
+    def get_mask_by_action(
+        self,
+        action: np.ndarray,
+        cam_name: str,
+        image_size: Tuple[int, int],
+    ) -> Optional[np.ndarray]:
+        if cam_name == "front":
+            return None
+
+        db = self.left_db if cam_name == "left" else self.right_db
+        model = self.left_model if cam_name == "left" else self.right_model
+
+        if db["actions"].shape[0] == 0:
+            return np.zeros(image_size, dtype=np.uint8)
+
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        dists = np.linalg.norm(db["actions"] - action[None, :], axis=1)
+        nn_idx = int(np.argmin(dists))
+        frame_index = int(db["frame_indices"][nn_idx])
+
+        h5_path = db["meta"].get("h5_path")
+        if h5_path is None:
+            return np.zeros(image_size, dtype=np.uint8)
+
+        h5_file = self._get_h5(h5_path)
+        cam_key = "cam_left_wrist" if cam_name == "left" else "cam_right_wrist"
+        rgb = h5_file[f"observations/images/{cam_key}"][frame_index]
+        rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        gt_mask = model.extract_gripper_mask_bgr(rgb_bgr)
+        if gt_mask.shape[:2] != image_size:
+            H, W = image_size
+            gt_mask = cv2.resize(gt_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+        return gt_mask.astype(np.uint8)
 
 
 class CondGenerator:
@@ -59,8 +159,12 @@ class CondGenerator:
         self.gripper_contact_min_points = 1
 
         # Wrist camera gripper GT 数据库（用于 gripper-proj 与 gripper-gt 匹配）
-        # TODO: 指定数据库路径并加载
-        self.gripper_gt_db = None
+        self.gripper_gt_provider = GripperGTMaskProvider(
+            urdf_path=self.urdf_path,
+            gripper_mesh_dir=self.gripper_mesh_dir,
+            link7_corr_path="../3d_control/trans_mat/link7_T_corr_2.npy",
+            link8_corr_path="../3d_control/trans_mat/link8_T_corr_2.npy",
+        )
 
         print(f"✓ 初始化完成\n")
 
@@ -586,82 +690,63 @@ class CondGenerator:
         action: np.ndarray,
         cam_name: str,
         image_size: Tuple[int, int] = (480, 640)
-    ) -> np.ndarray:
-        """
-        从预构建的 wrist camera 数据库中检索该 action 对应的 gripper 像素 mask (gripper-gt)
-
-        数据库存储了不同 action 下各相机中可见的 gripper 像素区域。
-        通过最近邻检索找到最匹配的 action，返回对应的 gripper binary mask。
-
-        Args:
-            action: [14,] 当前帧 qpos
-            cam_name: 相机名称 ('left', 'right', 'front')
-            image_size: 图像尺寸 (H, W)
-
-        Returns:
-            gripper_gt_mask: [H, W] bool, GT gripper 像素 mask
-
-        TODO:
-            - 定义数据库格式和存储路径（self.gripper_gt_db）
-            - 实现 action 空间的最近邻检索逻辑
-            - 处理 front camera（可同时看到双臂 gripper）与 wrist camera（只看到对应臂）的差异
-            - 考虑是否需要为每个 gripper link 返回独立 mask
-        """
-        raise NotImplementedError(
-            "_lookup_gripper_gt_mask: 需要实现 wrist camera 数据库检索。"
-            "数据库应提供 action → gripper 像素 mask 的映射。"
-        )
+    ) -> Optional[np.ndarray]:
+        """根据 action 检索 wrist 相机 gripper GT mask；front 视角返回 None。"""
+        return self.gripper_gt_provider.get_mask_by_action(action, cam_name, image_size)
 
     def _match_and_interpolate_gripper(
         self,
         proj_uv: np.ndarray,
         proj_values: np.ndarray,
-        gripper_gt_mask: np.ndarray,
+        gripper_gt_mask: Optional[np.ndarray],
         image_size: Tuple[int, int] = (480, 640)
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        核心共享函数: 将 gripper-proj（投影稀疏点）与 gripper-gt（GT dense mask）
-        进行形状匹配和插值，使 GT mask 中每个像素都获得对应的值。
+        """将投影 gripper 点匹配到 GT mask 并按最近邻索引填充值（仅 wrist）。"""
+        H, W = image_size
 
-        被以下函数调用:
-        - _project_gripper_to_image_refine: proj_values 为颜色 [N, 3]
-        - get_flow_project_refine: proj_values 为 3D flow [N, K, 3]
+        if proj_values.ndim == 2:
+            result_map = np.zeros((H, W, proj_values.shape[1]), dtype=proj_values.dtype)
+        elif proj_values.ndim == 3:
+            result_map = np.zeros((H, W, proj_values.shape[1], proj_values.shape[2]), dtype=proj_values.dtype)
+        else:
+            raise ValueError(f"不支持的 proj_values 维度: {proj_values.shape}")
 
-        流程:
-            1. 构建 gripper-proj mask: 将 proj_uv 栅格化为 [H, W] binary mask
-            2. 形状匹配: 将 gripper-proj mask 与 gripper-gt mask 大致对齐
-               （如基于轮廓的仿射/TPS 变换、ICP 等）
-               注意: 形状匹配只做一次，与 proj_values 的维度无关
-            3. 插值填充: 对 gripper-gt 中每个像素，基于匹配后的 gripper-proj
-               邻近点进行插值得到对应值（如 IDW、RBF、scipy.interpolate）
-               插值沿 values 的所有维度进行
+        filled_mask = np.zeros((H, W), dtype=bool)
+        if gripper_gt_mask is None:
+            return result_map, filled_mask
+        if proj_uv.size == 0 or proj_values.shape[0] == 0:
+            return result_map, filled_mask
 
-        Args:
-            proj_uv: [N, 2] float, gripper 3D 点投影到 2D 的像素坐标 (u, v)
-            proj_values: 每个投影点携带的值，支持两种形状:
-                         - [N, 3]: 颜色 (来自 _project_gripper_to_image_refine)
-                         - [N, K, 3]: K 帧 3D flow (来自 get_flow_project_refine)
-            gripper_gt_mask: [H, W] bool, 从数据库检索的 GT gripper 像素 mask
-            image_size: 图像尺寸 (H, W)
+        gt_mask = (gripper_gt_mask > 0).astype(np.uint8)
+        if gt_mask.shape[:2] != (H, W):
+            gt_mask = cv2.resize(gt_mask, (W, H), interpolation=cv2.INTER_NEAREST)
 
-        Returns:
-            result_map: gripper-gt 区域填充了插值后的值，其余为 0
-                        - 当 proj_values 为 [N, 3] 时: [H, W, 3]
-                        - 当 proj_values 为 [N, K, 3] 时: [H, W, K, 3]
-            filled_mask: [H, W] bool, 成功填充值的像素 mask
+        # 栅格化投影点
+        uv = np.round(np.asarray(proj_uv, dtype=np.float64)).astype(np.int32)
+        in_img = (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
+        if not np.any(in_img):
+            return result_map, filled_mask
 
-        TODO:
-            - Step 1: proj_uv 栅格化为 binary mask
-            - Step 2: 实现形状匹配算法（推荐: 基于轮廓质心对齐 + 仿射变换）
-            - Step 3: 实现插值方法（推荐: scipy.interpolate.griddata 或 IDW）
-              对 proj_values 的所有维度统一插值
-            - 处理 gripper-proj 点数过少的退化情况（直接返回零图）
-            - 处理 gripper-gt mask 为空的情况
-        """
-        raise NotImplementedError(
-            "_match_and_interpolate_gripper: 需要实现 gripper-proj 与 gripper-gt 的匹配和插值。"
-            "步骤: 1) proj_uv 栅格化 2) 形状对齐 3) 逐像素插值"
-        )
+        uv = uv[in_img]
+        values = proj_values[in_img]
+
+        proj_mask = np.zeros((H, W), dtype=np.uint8)
+        proj_mask[uv[:, 1], uv[:, 0]] = 255
+
+        # 参考 gripper_point2rgb.py: 膨胀 + 与 gt 并集，然后基于最近邻点索引回填数值
+        kernel = np.ones((5, 5), np.uint8)
+        dilated_proj_mask = cv2.dilate(proj_mask, kernel, iterations=1)
+        union_mask = cv2.bitwise_or(dilated_proj_mask, gt_mask)
+
+        index_map = self.gripper_gt_provider.left_model.assign_point_index_to_gripper_mask_tree(union_mask, uv)
+        valid = (gt_mask > 0) & (index_map >= 0)
+        if not np.any(valid):
+            return result_map, filled_mask
+
+        ys, xs = np.where(valid)
+        result_map[ys, xs] = values[index_map[ys, xs]]
+        filled_mask = valid
+        return result_map, filled_mask
 
     def _depth_to_pointcloud(
         self,
@@ -1047,7 +1132,7 @@ class CondGenerator:
                 'flow': flow_map
             })
             print(f"  {cam_name} link{link_idx+1}: "
-                  f"投影点 {valid_mask.sum()}, mask像素 {combined_mask.sum()}")
+                  f"投影点 {valid_mask.sum()}, mask像素 {filled_mask.sum()}")
 
         return results[0], results[1]
 
