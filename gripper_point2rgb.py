@@ -113,7 +113,8 @@ def normalize_mask_uv_to_rgb_canvas(
     proj_mask: np.ndarray,
     uv: np.ndarray,
     rgb_shape_hw: Tuple[int, int],
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_valid_mask: bool = False,
+):
     """将可能是 padding 尺寸的 mask/uv 映射回固定 RGB 画布尺寸。"""
     h, w = rgb_shape_hw
     hp, wp = proj_mask.shape[:2]
@@ -121,6 +122,8 @@ def normalize_mask_uv_to_rgb_canvas(
     out = np.zeros((h, w), dtype=np.uint8)
     uv = np.asarray(uv, dtype=np.int32)
     if uv.size == 0:
+        if return_valid_mask:
+            return out, np.zeros((0, 2), dtype=np.int32), np.zeros((0,), dtype=bool)
         return out, np.zeros((0, 2), dtype=np.int32)
 
     # 以中心对齐方式做裁剪/贴图
@@ -138,6 +141,8 @@ def normalize_mask_uv_to_rgb_canvas(
     v = uv[:, 1] - src_y0 + dst_y0
     valid = (u >= 0) & (u < w) & (v >= 0) & (v < h)
     uv_new = np.stack([u[valid], v[valid]], axis=1).astype(np.int32)
+    if return_valid_mask:
+        return out, uv_new, valid
     return out, uv_new
 
 
@@ -170,16 +175,24 @@ def align_pts_mask_to_gt(
     return aligned, warp
 
 
-def transform_uv_by_warp(uv: np.ndarray, warp_2x3: np.ndarray, canvas_hw: Tuple[int, int]) -> np.ndarray:
+def transform_uv_by_warp(
+    uv: np.ndarray,
+    warp_2x3: np.ndarray,
+    canvas_hw: Tuple[int, int],
+    point_indices: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     if uv.shape[0] == 0:
-        return uv
+        return uv, point_indices
     pts = np.concatenate([uv.astype(np.float32), np.ones((uv.shape[0], 1), dtype=np.float32)], axis=1)
     trans = (warp_2x3 @ pts.T).T
     u = np.round(trans[:, 0]).astype(np.int32)
     v = np.round(trans[:, 1]).astype(np.int32)
     h, w = canvas_hw
     valid = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    return np.stack([u[valid], v[valid]], axis=1)
+    uv_out = np.stack([u[valid], v[valid]], axis=1)
+    if point_indices is None:
+        return uv_out, None
+    return uv_out, np.asarray(point_indices)[valid]
 
 
 def save_bgr_frames_to_mp4(frames_bgr: List[np.ndarray], output_path: str, fps: int = 10) -> None:
@@ -230,35 +243,99 @@ def visualize_idx_map_on_mask(
     return vis
 
 
+def build_point_value_index_map(
+    idx_map: np.ndarray,
+    point_indices: Optional[np.ndarray],
+    point_count: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """将 idx_map(投影点索引) 映射为 point_values 原始索引图。"""
+    if point_indices is None:
+        mapped_idx_map = idx_map.astype(np.int64, copy=False)
+    else:
+        point_indices = np.asarray(point_indices).reshape(-1)
+        if point_indices.ndim != 1:
+            raise ValueError("point_indices 必须是一维数组")
+
+        mapped_idx_map = -np.ones_like(idx_map, dtype=np.int64)
+        valid_proj = (idx_map >= 0) & (idx_map < point_indices.shape[0])
+        if np.any(valid_proj):
+            mapped_idx_map[valid_proj] = point_indices[idx_map[valid_proj]]
+
+    valid_point = (mapped_idx_map >= 0) & (mapped_idx_map < point_count)
+    return mapped_idx_map, valid_point
+
+
+def paint_mask_with_values(
+    gripper_mask: np.ndarray,
+    idx_map: np.ndarray,
+    point_values: np.ndarray,
+    invalid_value: float = 0.0,
+    left_gripper_count: int = 5000,
+    point_indices: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    按 idx_map 将点级 value 填充到像素网格，并返回填充状态和左右夹爪来源。
+
+    Args:
+        gripper_mask: (H, W) binary / uint8 mask
+        idx_map:      (H, W) int, -1 表示该像素未分配到点
+        point_values: (N, 3) 或 (N, K, 3)
+        invalid_value: 未填充像素的默认值
+        left_gripper_count: gripper_pts 前多少个点视为 left gripper
+        point_indices: (M,) 可选。若提供，则 idx_map 的索引先映射到 point_values 的原始索引。
+            常见于 idx_map 是 "投影后点集" 的索引，而非原始 gripper_pts 索引。
+
+    Returns:
+        result_map:
+            - point_values 为 (N, 3) 时，shape=(H, W, 3)
+            - point_values 为 (N, K, 3) 时，shape=(H, W, K, 3)
+        filled_mask: (H, W) bool，成功填充值的位置
+        lr_mask:     (H, W) int8，left=0, right=1, invalid=-1
+    """
+    H, W = gripper_mask.shape
+    values = np.asarray(point_values)
+    if values.ndim not in (2, 3) or values.shape[-1] != 3:
+        raise ValueError(
+            "point_values 只支持 (N, 3) 或 (N, K, 3) 两种形状，且最后一维必须为 3"
+        )
+
+    num_points = values.shape[0]
+    if values.ndim == 2:
+        result_map = np.full((H, W, 3), invalid_value, dtype=values.dtype)
+    else:
+        result_map = np.full((H, W, values.shape[1], 3), invalid_value, dtype=values.dtype)
+
+    mapped_idx_map, valid_point = build_point_value_index_map(idx_map, point_indices, num_points)
+    filled_mask = (gripper_mask > 0) & valid_point
+    if np.any(filled_mask):
+        ys, xs = np.where(filled_mask)
+        result_map[ys, xs] = values[mapped_idx_map[ys, xs]]
+
+    lr_mask = np.full((H, W), -1, dtype=np.int8)
+    if np.any(filled_mask):
+        valid_indices = mapped_idx_map[filled_mask]
+        lr_mask[filled_mask] = (valid_indices >= left_gripper_count).astype(np.int8)
+
+    return result_map, filled_mask, lr_mask
+
+
 def paint_mask_with_k3_values(
     gripper_mask: np.ndarray,
     idx_map: np.ndarray,
     point_values: np.ndarray,
     invalid_value: float = 0.0,
+    point_indices: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """
-    Assign [k,3] values to each pixel in gripper_mask using idx_map.
-
-    Args:
-        gripper_mask: (H, W) binary mask
-        idx_map:      (H, W) int, -1 means invalid
-        point_values: (N, k, 3)
-
-    Returns:
-        value_map: (H, W, k, 3)
-    """
-    H, W = gripper_mask.shape
-    k = point_values.shape[1]
-
-    value_map = np.full((H, W, k, 3), invalid_value, dtype=point_values.dtype)
-
-    valid = (gripper_mask > 0) & (idx_map >= 0)
-    if not np.any(valid):
-        return value_map
-
-    ys, xs = np.where(valid)
-    value_map[ys, xs] = point_values[idx_map[ys, xs]]
-
+    """兼容旧接口：仅返回 (H, W, K, 3) value_map。"""
+    value_map, _, _ = paint_mask_with_values(
+        gripper_mask=gripper_mask,
+        idx_map=idx_map,
+        point_values=point_values,
+        invalid_value=invalid_value,
+        point_indices=point_indices,
+    )
+    if value_map.ndim != 4:
+        raise ValueError("point_values 应为 (N, K, 3)，当前收到的是 (N, 3)")
     return value_map
 
 
@@ -317,31 +394,43 @@ def run_workflow(
         h, w = rgb_bgr.shape[:2]
 
         uv_all = []
+        uv_point_indices_all = []
         pts_mask_all = np.zeros((h, w), dtype=np.uint8)
 
         # 根据 book 中可用记录决定处理哪些 arm
         active_arms = get_available_arms(book, camera=camera)
         for arm in active_arms:
             gripper_pts = model.gripper_pointcloud_from_action(action*2, arm=arm, sample_count=sample_count)["all"]
+            arm_offset = 0 if arm == "left" else sample_count
             T_proj = get_projection_T_from_book(book, action, arm=arm, camera=camera, frame_index=idx)
             gripper_pts_t = model.transform_points(gripper_pts, T_proj)
 
-            proj_mask_pad, uv_pad = model.project_points_to_mask(
+            proj_mask_pad, uv_pad, point_idx_pad = model.project_points_to_mask(
                 gripper_pts_t,
                 (h, w),
                 camera_name=camera,
+                return_point_indices=True,
             )
-            proj_mask, uv = normalize_mask_uv_to_rgb_canvas(proj_mask_pad, uv_pad, (h, w))
+            proj_mask, uv, uv_valid_mask = normalize_mask_uv_to_rgb_canvas(
+                proj_mask_pad,
+                uv_pad,
+                (h, w),
+                return_valid_mask=True,
+            )
 
             pts_mask_all = cv2.bitwise_or(pts_mask_all, proj_mask)
 
             if uv.shape[0] > 0:
+                point_idx = point_idx_pad[uv_valid_mask] + arm_offset
                 uv_all.append(uv)
+                uv_point_indices_all.append(point_idx.astype(np.int32))
 
         if len(uv_all) == 0:
             uv_all_cat = np.zeros((0, 2), dtype=np.int32)
+            uv_point_indices_cat = np.zeros((0,), dtype=np.int32)
         else:
             uv_all_cat = np.concatenate(uv_all, axis=0)
+            uv_point_indices_cat = np.concatenate(uv_point_indices_all, axis=0)
 
         gt_mask = model.extract_gripper_mask_bgr(rgb_bgr)
 
@@ -352,10 +441,11 @@ def run_workflow(
         if enable_mask_align:
             # 关键：对齐投影 mask 到 gt_mask
             aligned_pts_mask, warp = align_pts_mask_to_gt(pts_mask_all, gt_mask)
-            uv_final = transform_uv_by_warp(uv_all_cat, warp, (h, w))
+            uv_final, uv_point_idx_final = transform_uv_by_warp(uv_all_cat, warp, (h, w), point_indices=uv_point_indices_cat)
         else:
             aligned_pts_mask = pts_mask_all
             uv_final = uv_all_cat
+            uv_point_idx_final = uv_point_indices_cat
 
         # 膨胀 + 并集
         kernel = np.ones((5, 5), np.uint8)
@@ -364,7 +454,11 @@ def run_workflow(
 
         # start_time = time()
         # 将 union_mask 赋点云索引
-        index_map = model.assign_point_index_to_gripper_mask_tree(union_mask, uv_final)
+        index_map = model.assign_point_index_to_gripper_mask_tree(
+            union_mask,
+            uv_final,
+            point_indices=uv_point_idx_final,
+        )
         # print("index select time:", time() - start_time)
 
         # 可视化: GT(绿) + 对齐后点云mask(红)

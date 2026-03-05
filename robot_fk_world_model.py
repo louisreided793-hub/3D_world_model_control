@@ -179,6 +179,7 @@ class RobotFKWorldModel:
         camera_name: Optional[str] = None,
         pad: int = 50,
         flip_along_h: bool = True,
+        return_point_indices: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         将点云投影为 mask（自适应 padding 版本）。
@@ -188,6 +189,7 @@ class RobotFKWorldModel:
         - 实际 padding 会根据当前投影 u/v 越界量动态计算，越界越多 padding 越大；
         - 随着 gripper 对齐后越界量变小，padding 会自动减小；
         - `flip_along_h=True` 时，会沿 H 方向做镜像翻转（上下翻转）。
+        - `return_point_indices=True` 时，额外返回每个投影像素对应的原始点索引（相对 points_cam）。
         """
         camera_name = camera_name or self.default_camera
         K = self.cameras[camera_name].intrinsic
@@ -195,10 +197,15 @@ class RobotFKWorldModel:
         z = points_cam[:, 2]
         valid_z = z > 1e-6
         pts = points_cam[valid_z]
+        base_indices = np.flatnonzero(valid_z).astype(np.int32)
 
         h, w = image_shape
         if pts.shape[0] == 0:
-            return np.zeros((h + 2 * pad, w + 2 * pad), dtype=np.uint8), np.zeros((0, 2), dtype=np.int32)
+            empty_mask = np.zeros((h + 2 * pad, w + 2 * pad), dtype=np.uint8)
+            empty_uv = np.zeros((0, 2), dtype=np.int32)
+            if return_point_indices:
+                return empty_mask, empty_uv, np.zeros((0,), dtype=np.int32)
+            return empty_mask, empty_uv
 
         z = pts[:, 2]
         uvw = (K @ pts.T).T
@@ -220,6 +227,7 @@ class RobotFKWorldModel:
 
         in_canvas = (up >= 0) & (up < wp) & (vp >= 0) & (vp < hp)
         up, vp = up[in_canvas], vp[in_canvas]
+        kept_indices = base_indices[in_canvas]
 
         mask = np.zeros((hp, wp), dtype=np.uint8)
         mask[vp, up] = 255
@@ -228,7 +236,10 @@ class RobotFKWorldModel:
             mask = np.flip(mask, axis=0)
             vp = (hp - 1) - vp
 
-        return mask, np.stack([up, vp], axis=1)
+        uv = np.stack([up, vp], axis=1)
+        if return_point_indices:
+            return mask, uv, kept_indices
+        return mask, uv
 
     @staticmethod
     def overlay_masks(rgb_bgr: np.ndarray, gt_mask: np.ndarray, proj_mask: np.ndarray) -> np.ndarray:
@@ -388,10 +399,15 @@ class RobotFKWorldModel:
     def assign_point_index_to_gripper_mask_tree(
             gripper_mask: np.ndarray,
             uv_pixels: np.ndarray,
+            point_indices: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         For each pixel (y, x) where gripper_mask > 0,
         assign the index of the nearest projected point in uv_pixels.
+
+        Args:
+            point_indices: 可选，shape=(M,)。若提供，表示 uv_pixels 每个投影点对应的原始点索引。
+                返回 idx_map 时会直接写入该原始索引。
 
         Returns:
             idx_map: (H, W) int32, -1 for invalid pixels
@@ -412,12 +428,22 @@ class RobotFKWorldModel:
         if not np.any(valid):
             return idx_map
 
+        orig_indices = np.flatnonzero(valid).astype(np.int32)
         uv = uv[valid]
+
+        if point_indices is None:
+            point_ids = orig_indices
+        else:
+            point_indices = np.asarray(point_indices).reshape(-1)
+            if point_indices.shape[0] != uv_pixels.shape[0]:
+                raise ValueError("point_indices 长度必须与 uv_pixels 一致")
+            point_ids = point_indices[valid].astype(np.int32, copy=False)
 
         # --------------------------------------------------
         # 2. 直接命中的像素先写入（O(M)，很快）
         # --------------------------------------------------
-        idx_map[uv[:, 1], uv[:, 0]] = np.arange(len(uv), dtype=np.int32)
+        # 注意：这里写入的是原始 uv_pixels 中的索引，避免因 valid 过滤导致索引重排。
+        idx_map[uv[:, 1], uv[:, 0]] = point_ids
 
         # --------------------------------------------------
         # 3. 只对 mask 内像素做 NN 查询
@@ -435,7 +461,8 @@ class RobotFKWorldModel:
         tree = cKDTree(proj_points)
         nn_idx = tree.query(query_pixels, k=1, workers=-1)[1].astype(np.int32)
 
-        idx_map[ys, xs] = nn_idx
+        # nn_idx 是过滤后 uv 的局部索引，需要映射回原始 uv_pixels 索引。
+        idx_map[ys, xs] = point_ids[nn_idx]
         return idx_map
 
     @staticmethod
